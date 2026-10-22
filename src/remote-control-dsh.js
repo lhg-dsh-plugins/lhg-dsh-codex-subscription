@@ -1,0 +1,1225 @@
+// Maps DSH sessions onto the Codex app-server vocabulary (thread / turn / item)
+// so the ChatGPT mobile app can list, open, start and continue them. All
+// session work goes through DSH's own session controller, the same service
+// the DSH web client uses: listing, creating, prompting, model selection.
+
+import { randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute } from 'node:path'
+import { RpcError, invalidParams } from './remote-control-host.js'
+import { homeFolderAnswer, runGit } from './remote-control-git.js'
+import { phoneGitProbe, runPhoneGitProbe } from './remote-control-git-probes.js'
+import { searchFiles } from './remote-control-files.js'
+import { createRealtimeVoice, createVoiceCall, desktopInstructions } from './remote-control-realtime.js'
+import { diagnosticLog } from './diagnostic-log.js'
+
+/** A folder the phone named, only when it is an existing absolute folder on this machine. */
+export function localFolder(value) {
+  if (typeof value !== 'string' || value === '' || !isAbsolute(value)) return undefined
+  if (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/u.test(value)) return undefined
+  try { return statSync(value).isDirectory() ? value : undefined } catch { return undefined }
+}
+
+/** Whether two local folders are the same one: real paths compared, separators unified, case ignored on Windows. */
+export function samePath(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string' || left === '' || right === '') return false
+  const normal = value => {
+    let resolved = value
+    try { resolved = realpathSync.native(value) } catch {}
+    resolved = resolved.replace(/\\/gu, '/').replace(/(?<=.)\/+$/u, '')
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  }
+  return normal(left) === normal(right)
+}
+
+/** One image the phone attached, sent inline as a data URL (its own file paths mean nothing on this machine). */
+export function dataImage(url) {
+  const match = typeof url === 'string' ? /^data:(image\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/u.exec(url) : null
+  return match ? { mediaType: match[1].toLowerCase(), data: new Uint8Array(Buffer.from(match[2], 'base64')) } : undefined
+}
+const inputImages = input => (Array.isArray(input) ? input : []).filter(part => part?.type === 'image' && typeof part.url === 'string')
+const MAX_PHONE_IMAGES = 8
+
+/** Facts about a real local file or folder the phone asks about, so its folder picker shows what is on this machine. */
+function realMetadata(value) {
+  if (typeof value !== 'string' || !isAbsolute(value)) return undefined
+  try {
+    const stat = statSync(value)
+    return { isDirectory: stat.isDirectory(), isFile: stat.isFile(), isSymlink: false, createdAtMs: Math.floor(stat.birthtimeMs), modifiedAtMs: Math.floor(stat.mtimeMs) }
+  } catch { return undefined }
+}
+/** Names inside a real local folder (folders first, hidden ones left out, bounded); nothing for anything else. */
+export function readFolder(value) {
+  const folder = localFolder(value)
+  if (!folder) return []
+  try {
+    return readdirSync(folder, { withFileTypes: true })
+      .filter(entry => !entry.name.startsWith('.') && (entry.isDirectory() || entry.isFile()))
+      .map(entry => ({ fileName: entry.name, isDirectory: entry.isDirectory(), isFile: entry.isFile() }))
+      .sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.fileName.localeCompare(b.fileName))
+      .slice(0, 500)
+  } catch { return [] }
+}
+
+/** Offset paging over a full list, the way the phone asks for it (cursor is the next offset). */
+function page(list, params) {
+  const start = Number.isInteger(Number(params?.cursor)) ? Math.max(0, Number(params.cursor)) : 0
+  const limit = Number.isInteger(params?.limit) && params.limit > 0 ? params.limit : list.length
+  const data = list.slice(start, start + limit)
+  return { data, nextCursor: start + limit < list.length ? String(start + limit) : null, backwardsCursor: null }
+}
+
+/** Codex usage as the phone's rate-limit snapshot (primary and secondary windows of the main limit). */
+function rateLimits(read) {
+  const toWindow = entry => entry && ({ usedPercent: Math.round(entry.usedPercent), windowDurationMins: Math.round(entry.windowSeconds / 60), resetsAt: entry.resetsAt ?? null })
+  const snapshot = limit => ({
+    limitId: limit?.id ?? 'codex', limitName: limit?.name ?? null, normalModelSlug: null,
+    primary: toWindow(limit?.windows?.[0]) ?? null, secondary: toWindow(limit?.windows?.[1]) ?? null,
+    credits: null, individualLimit: null, spendControlReached: read?.spendControlReached ?? null, planType: read?.planType ?? null, rateLimitReachedType: read?.rateLimitReachedType ?? null,
+  })
+  const main = read?.rateLimits?.find(limit => limit.id === 'codex') ?? read?.rateLimits?.[0]
+  return {
+    ordinaryUsageAllowed: null, rateLimits: snapshot(main),
+    rateLimitsByLimitId: read ? Object.fromEntries((read.rateLimits ?? []).map(limit => [limit.id, snapshot(limit)])) : null,
+    rateLimitResetCredits: null, accountId: null, rateLimitUpsell: null,
+  }
+}
+
+/** First place `term` appears in `text`: a short passage around it and the match's UTF-16 range inside that passage. */
+export function occurrence(text, term, radius = 60) {
+  const at = String(text).toLocaleLowerCase().indexOf(String(term).toLocaleLowerCase())
+  if (at < 0) return undefined
+  const start = Math.max(0, at - radius)
+  const end = Math.min(text.length, at + term.length + radius)
+  const snippet = `${start > 0 ? '…' : ''}${text.slice(start, end).replace(/\s+/gu, ' ')}${end < text.length ? '…' : ''}`
+  const from = (start > 0 ? 1 : 0) + text.slice(start, at).replace(/\s+/gu, ' ').length
+  return { snippet, snippetMatchRange: { start: from, end: from + text.slice(at, at + term.length).replace(/\s+/gu, ' ').length } }
+}
+
+const seconds = value => Math.floor((Number.isFinite(value) ? value : Date.now()) / 1000)
+const emptyTurn = () => ({ id: randomUUID(), items: [], itemsView: 'full', status: 'inProgress', error: null, startedAt: seconds(Date.now()), completedAt: null, durationMs: null })
+const textOf = content => (content ?? []).map(block => block?.type === 'text' ? block.text : '').filter(Boolean).join('\n')
+const inputText = input => (Array.isArray(input) ? input : []).map(part => part?.type === 'text' ? part.text : '').filter(Boolean).join('\n')
+/** Skills the phone picked, written the way DSH invokes a skill: a /name gesture ahead of the text. */
+const skillGestures = input => (Array.isArray(input) ? input : []).filter(part => part?.type === 'skill' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(String(part.name))).map(part => `/${part.name}`)
+const notFound = id => new RpcError(-32602, `Thread not found: ${String(id).slice(0, 80)}`)
+
+// Model ids travel as "provider/model" so one picker can hold every DSH provider.
+export const modelKey = selection => `${encodeURIComponent(selection.provider)}/${encodeURIComponent(selection.model)}`
+export function parseModelKey(value) {
+  const at = typeof value === 'string' ? value.indexOf('/') : -1
+  if (at <= 0) return undefined
+  try { return { provider: decodeURIComponent(value.slice(0, at)), model: decodeURIComponent(value.slice(at + 1)) } } catch { return undefined }
+}
+
+function parseArguments(value) {
+  if (typeof value !== 'string') return value ?? null
+  try { return JSON.parse(value) } catch { return { raw: value } }
+}
+
+/** What the person typed: DSH appends its own system reminders (skills, context) to user messages. */
+export const visibleText = content => textOf(content).replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gu, '').trim()
+/** Text of a user-role message the person wrote; DSH's own injected ones (runtime context, notices) carry another source kind. */
+export const typedText = message => message.role === 'user' && (message.source === undefined || message.source?.kind === 'user') ? visibleText(message.content) : ''
+
+const lines = text => String(text ?? '').split('\n')
+const added = text => lines(text).map(line => `+${line}`).join('\n')
+const removed = text => lines(text).map(line => `-${line}`).join('\n')
+
+/**
+ * How a DSH tool call looks on the phone: shell commands and file edits use the phone's own
+ * command and diff views; everything else stays a generic tool call.
+ */
+export function toolItem(block, cwd) {
+  const args = parseArguments(block.arguments)
+  const base = { id: block.id, status: 'inProgress' }
+  if (/^(bash|pwsh)(_persistent)?$/u.test(block.name) && typeof args?.command === 'string') {
+    return { type: 'commandExecution', ...base, command: args.command, cwd: typeof args.workdir === 'string' ? args.workdir : cwd ?? '', processId: null, source: 'agent', commandActions: [], aggregatedOutput: null, exitCode: null, durationMs: null }
+  }
+  if (block.name === 'edit' && typeof args?.file_path === 'string') {
+    return { type: 'fileChange', ...base, changes: [{ path: args.file_path, kind: { type: 'update', move_path: null }, diff: `@@\n${removed(args.old_string)}\n${added(args.new_string)}` }] }
+  }
+  if (block.name === 'write' && typeof args?.file_path === 'string') {
+    return { type: 'fileChange', ...base, changes: [{ path: args.file_path, kind: { type: 'add' }, diff: added(args.content) }] }
+  }
+  if (block.name === 'codex_image_generate') {
+    return { type: 'imageGeneration', ...base, revisedPrompt: typeof args?.prompt === 'string' ? args.prompt : null, result: '' }
+  }
+  // The phone has its own views for a web search, a page opened and a connector (MCP-style) tool call.
+  if (block.name === 'web_search' && Array.isArray(args?.queries)) {
+    const queries = args.queries.filter(entry => typeof entry === 'string' && entry !== '')
+    if (queries.length > 0) return { type: 'webSearch', id: block.id, query: queries.join(' · '), action: { type: 'search', query: queries[0], queries }, results: null }
+  }
+  if (block.name === 'web_fetch' && typeof args?.url === 'string') {
+    return { type: 'webSearch', id: block.id, query: args.url, action: { type: 'openPage', url: args.url }, results: null }
+  }
+  if (block.name === 'chatgpt_connectors_call' && typeof args?.name === 'string') {
+    return { type: 'mcpToolCall', ...base, server: 'chatgpt', tool: args.name, arguments: args.arguments ?? {}, result: null, error: null, durationMs: null }
+  }
+  return { type: 'dynamicToolCall', ...base, namespace: null, tool: block.name, arguments: args, contentItems: null, success: null, durationMs: null }
+}
+/** Record a tool's result on the item that showed the call. */
+export function finishTool(item, message, imageUrls) {
+  const failed = Boolean(message.isError)
+  item.status = failed ? 'failed' : 'completed'
+  if (item.type === 'commandExecution') { item.aggregatedOutput = textOf(message.content); item.exitCode = failed ? 1 : 0 }
+  else if (item.type === 'imageGeneration') {
+    // The phone's own image view takes the picture as base64; a failed or unreadable one keeps the text.
+    const url = imageBlocks(message).map(block => imageUrls.get(block.attachment.attachmentId)).find(Boolean)
+    item.result = url ? url.slice(url.indexOf(',') + 1) : ''
+    if (!url) item.status = 'failed'
+  } else if (item.type === 'dynamicToolCall') { item.contentItems = toolOutput(message, imageUrls); item.success = !failed }
+  else if (item.type === 'mcpToolCall') {
+    const text = textOf(message.content)
+    if (failed) item.error = { message: text.slice(0, 500) || 'The connector tool failed' }
+    else item.result = { content: [{ type: 'text', text }], structuredContent: null }
+  }
+}
+
+const imageBlocks = message => (message.content ?? []).filter(block => block?.type === 'image' && block.attachment)
+const toolOutput = (message, imageUrls) => [
+  { type: 'inputText', text: textOf(message.content) },
+  ...imageBlocks(message).map(block => imageUrls.get(block.attachment.attachmentId)).filter(Boolean).map(imageUrl => ({ type: 'inputImage', imageUrl })),
+]
+
+/** One user message starts a turn; assistant blocks and tool results fill it. */
+
+/** Images the person attached to a message of their own. */
+export const typedImages = message => message.role === 'user' && (message.source === undefined || message.source?.kind === 'user')
+  ? (message.content ?? []).filter(block => block?.type === 'image' && block.attachment)
+  : []
+
+/** `imageUrls` maps an attachment id to a data URL the phone can show; images without one are left out. */
+export function projectTurns(messages, at = Date.now(), imageUrls = new Map(), cwd = undefined) {
+  const turns = []
+  let turn
+  const calls = new Map()
+  const close = () => { if (turn && turn.items.length > 0) { turn.status = 'completed'; turn.completedAt = turn.startedAt; turns.push(turn) } turn = undefined }
+  for (const message of messages) {
+    if (message.role === 'user') {
+      const text = typedText(message)
+      const pictures = typedImages(message).map(block => imageUrls.get(block.attachment.attachmentId)).filter(Boolean)
+      if (text === '' && pictures.length === 0) continue
+      close()
+      turn = { ...emptyTurn(), id: message.id, startedAt: seconds(at) }
+      turn.items.push({ type: 'userMessage', id: message.id, clientId: null, content: [...(text === '' ? [] : [{ type: 'text', text, text_elements: [] }]), ...pictures.map(url => ({ type: 'image', url }))] })
+    } else if (message.role === 'assistant') {
+      turn ??= { ...emptyTurn(), startedAt: seconds(at) }
+      for (const [index, block] of message.content.entries()) {
+        const id = `${message.id}:${index}`
+        if (block.type === 'text') turn.items.push({ type: 'agentMessage', id, text: block.text, phase: null, memoryCitation: null, delivery: null })
+        else if (block.type === 'reasoning') turn.items.push({ type: 'reasoning', id, summary: [], content: [block.text] })
+        else if (block.type === 'tool-call') {
+          const item = toolItem(block, cwd)
+          calls.set(block.id, item)
+          turn.items.push(item)
+        }
+      }
+    } else if (message.role === 'tool') {
+      const item = calls.get(message.toolCallId)
+      if (item) finishTool(item, message, imageUrls)
+    }
+  }
+  close()
+  return turns
+}
+
+function thread({ id, title, preview, cwd, createdAt, updatedAt, running, turns = [], projectId = null, threadSource = 'dsh' }) {
+  return {
+    id, sessionId: id, forkedFromId: null, parentThreadId: null, preview: preview ?? title ?? '', ephemeral: false,
+    modelProvider: 'dsh', createdAt: seconds(createdAt), updatedAt: seconds(updatedAt ?? createdAt), recencyAt: seconds(updatedAt ?? createdAt),
+    status: running ? { type: 'active', activeFlags: [] } : { type: 'idle' }, path: null, cwd: cwd ?? '',
+    cliVersion: 'dsh', source: { custom: 'dsh' }, threadSource, agentNickname: null, agentRole: null,
+    gitInfo: null, name: title ?? null, turns, historyMode: 'legacy', section: null, sectionEnteredAt: null,
+    projectId, canAcceptDirectInput: true, extra: null,
+  }
+}
+
+/**
+ * @param {{ controller: () => any, agents: () => any, permissions?: () => any, userAgent: string }} options
+ */
+// How long a question or approval waits for a phone that dropped while it was open.
+const PHONE_RETURN_MS = 120_000
+// How long after it last had a thread open a reconnecting phone is assumed to still want it.
+const ADOPT_WITHIN_MS = 600_000
+
+// The voices Codex itself offers per realtime version (codex-rs/protocol RealtimeVoicesList::builtin). The phone shows the
+// list for the version it starts (v3 for the live voice), so every list has to be present.
+const V1_VOICES = ['juniper', 'maple', 'spruce', 'ember', 'vale', 'breeze', 'arbor', 'sol', 'cove']
+const REALTIME_VOICES = {
+  v1: V1_VOICES,
+  v2: ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar'],
+  v3: [...V1_VOICES, 'aube', 'bubbie', 'haetsal', 'hanul', 'himari', 'leher', 'miko', 'neer', 'porto', 'rindo', 'rio', 'rivage', 'selva', 'sonna', 'tinta', 'viola'],
+  defaultV1: 'cove', defaultV2: 'marin',
+}
+
+/** The phone's saved defaults, nested like a config file and kept across restarts. */
+export function createPhoneConfig(file) {
+  let value = {}
+  try { if (file) value = JSON.parse(readFileSync(file, 'utf8')) } catch { /* a first run has none */ }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) value = {}
+  const save = () => { if (!file) return; try { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(value)) } catch { /* the defaults then last for this run */ } }
+  const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype'])
+  return {
+    read: () => structuredClone(value),
+    write(edits) {
+      if (!Array.isArray(edits)) return
+      for (const edit of edits.slice(0, 50)) {
+        const path = typeof edit?.keyPath === 'string' ? edit.keyPath.split('.').filter(Boolean) : []
+        if (path.length === 0 || path.length > 6 || path.some(part => FORBIDDEN.has(part))) continue
+        let node = value
+        for (const part of path.slice(0, -1)) { if (node[part] === null || typeof node[part] !== 'object') node[part] = {}; node = node[part] }
+        if (edit.value === null || edit.value === undefined) delete node[path.at(-1)]
+        else node[path.at(-1)] = edit.value
+      }
+      save()
+    },
+  }
+}
+
+export function createDshRemoteControl({ controller, agents, permissions = () => undefined, workspaces = () => undefined, attachments = () => undefined, usage = () => undefined, usageProfile = () => undefined, projections = () => undefined, skills = () => undefined, commands = () => undefined, llm = () => undefined, speed = undefined, trace = () => {}, phoneReturnMs = PHONE_RETURN_MS, userAgent, appServerUserAgent = userAgent, configFile = undefined, voice = undefined }) {
+  const subscribers = new Map() // threadId -> Set<notify>
+  const threadSources = new Map() // threadId -> the source the phone named when it created the thread ("user", "realtime_voice", ...)
+  const active = new Map() // threadId -> { turn }
+  const queues = new Map() // threadId -> QueuedSubmission[]
+  let catalog
+
+  const service = () => {
+    const value = controller()
+    if (!value) throw new RpcError(-32603, 'DSH session service is unavailable in this profile')
+    return value
+  }
+  const arrivals = new Map() // threadId -> Set<() => void>, woken when a phone opens the thread
+  const openedBy = new Map() // clientId -> Map<threadId, last time one of its connections had the thread open>
+  const subscribe = (threadId, notify) => {
+    const set = subscribers.get(threadId) ?? new Set()
+    // One phone has one live stream per thread: an older stream of the same phone no longer gets (and doubles) the updates.
+    if (notify.clientId) for (const other of [...set]) if (other !== notify && other.clientId === notify.clientId) set.delete(other)
+    set.add(notify)
+    subscribers.set(threadId, set)
+    if (notify.clientId) {
+      const opened = openedBy.get(notify.clientId) ?? new Map()
+      opened.set(threadId, Date.now())
+      openedBy.set(notify.clientId, opened)
+    }
+    for (const wake of arrivals.get(threadId) ?? []) wake()
+  }
+  /** Wait until a phone opens the thread again, the signal aborts, or the time runs out. */
+  const phoneReturns = (threadId, ms, signal) => new Promise(resolve => {
+    const set = arrivals.get(threadId) ?? new Set()
+    arrivals.set(threadId, set)
+    const done = value => { clearTimeout(timer); set.delete(wake); signal?.removeEventListener('abort', stop); if (set.size === 0) arrivals.delete(threadId); resolve(value) }
+    const wake = () => done(true)
+    const stop = () => done(false)
+    const timer = setTimeout(stop, ms)
+    set.add(wake)
+    signal?.addEventListener('abort', stop, { once: true })
+  })
+  const emit = (threadId, method, params) => {
+    for (const notify of subscribers.get(threadId) ?? []) void notify(method, params).catch(() => {})
+  }
+  const agentFor = async id => {
+    const result = await service().resolveAgent(id)
+    if (!result?.agent) throw notFound(id)
+    return result.agent
+  }
+  const loadCatalog = async () => {
+    catalog = await service().modelCatalog()
+    return catalog
+  }
+  // The model of a conversation is the last model/selection event in its log; a freshly loaded agent reports DSH's
+  // newest default instead. A pick the log has not recorded yet (DSH applies it at the next turn) is remembered here.
+  const pickedBy = new Map() // threadId -> { selection, was } (was: what the log said when it was picked)
+  const recorded = agent => {
+    try {
+      const session = agent?.session
+      // A running session has no cached snapshot; it reads its events through snapshotEvents().
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : session?.eventsSnapshot
+      for (let index = (events?.length ?? 0) - 1; index >= 0; index -= 1) {
+        const data = events[index]?.type === 'model/selection' ? events[index].data : undefined
+        if (data?.provider && data?.model) return { provider: data.provider, model: data.model, reasoningEffort: data.reasoningEffort }
+      }
+    } catch { /* fall back to the agent's own setting */ }
+    return agent?.options?.provider && agent?.options?.model
+      ? { provider: agent.options.provider, model: agent.options.model, reasoningEffort: agent.options.reasoningEffort }
+      : undefined
+  }
+  // DSH 0.2.1-alpha.3 and later can change a conversation's working directory; the last
+  // working-directory/change event wins over the project the conversation started in.
+  const directoryOf = session => {
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : session?.eventsSnapshot
+      for (let index = (events?.length ?? 0) - 1; index >= 0; index -= 1) {
+        const cwd = events[index]?.type === 'working-directory/change' ? events[index].data?.cwd : undefined
+        if (typeof cwd === 'string' && cwd !== '') return cwd
+      }
+    } catch { /* keep the project directory */ }
+    return session?.meta?.cwd
+  }
+  const sameSelection = (a, b) => a?.provider === b?.provider && a?.model === b?.model && a?.reasoningEffort === b?.reasoningEffort
+  const selection = agent => {
+    const saved = recorded(agent)
+    const remembered = pickedBy.get(agent?.session?.id)
+    if (remembered && sameSelection(saved, remembered.was)) return remembered.selection
+    // A model DSH no longer offers (a retired one) would leave the phone's picker on nothing: show the default instead.
+    const offered = !saved || !catalog?.groups || catalog.groups.some(group => group.id === saved.provider && (group.models ?? []).some(model => model.id === saved.model))
+    return offered ? saved ?? catalog?.default : catalog?.default
+  }
+  const settings = (agent, cwd) => {
+    const current = selection(agent)
+    const preset = agent?.session ? presetOf(agent.session) : undefined
+    return {
+      activePermissionProfile: null, approvalPolicy: preset === 'danger-full-access' ? 'never' : 'on-request', approvalsReviewer: 'user', cwd: cwd ?? '',
+      initialTurnsPage: null, instructionSources: [], itemsBackwardsCursor: null,
+      model: current ? modelKey(current) : 'dsh/default', modelProvider: current?.provider ?? 'dsh',
+      multiAgentMode: 'explicitRequestOnly', reasoningEffort: current?.reasoningEffort ?? null, runtimeWorkspaceRoots: cwd ? [cwd] : [],
+      sandbox: sandboxFor(preset, cwd), serviceTier: shownTier(), turnsBackwardsCursor: null,
+    }
+  }
+  const searches = new Map() // fuzzy-search session id -> { roots, notify }
+  /** Folders of DSH workspaces and conversations: the only places the phone may search or run git. */
+  const conversationFolders = async () => {
+    const items = (await service().list({}).catch(() => ({ items: [] }))).items ?? []
+    return [...workspaceList().map(entry => entry.path), ...items.map(item => item.cwd)].filter(folder => typeof folder === 'string' && folder !== '')
+  }
+
+  /** DSH's token and context-window projections as the phone's token-usage ring. */
+  const tokenUsage = session => {
+    try {
+      const values = projections()?.snapshot?.(session, ['tokenUsage', 'contextPressure'])?.values
+      const used = values?.tokenUsage
+      if (!used) return undefined
+      const breakdown = (total, input, cached, output) => ({ totalTokens: total, inputTokens: input, cachedInputTokens: cached, cacheWriteInputTokens: 0, outputTokens: output, reasoningOutputTokens: 0 })
+      const input = (used.uncachedInputTokens ?? 0) + (used.cacheReadTokens ?? 0) + (used.cacheWriteTokens ?? 0)
+      const pressure = values.contextPressure?.pressureTokens ?? 0
+      return {
+        total: breakdown(input + (used.outputTokens ?? 0), input, used.cacheReadTokens ?? 0, used.outputTokens ?? 0),
+        last: breakdown(pressure, pressure, 0, 0), modelContextWindow: values.contextPressure?.contextWindow ?? null,
+      }
+    } catch { return undefined }
+  }
+
+  // DSH workspaces are the phone's projects: a named folder with its conversations.
+  const workspaceList = () => { try { return workspaces()?.list?.() ?? [] } catch { return [] } }
+  const projectIdOf = sessionId => workspaceList().find(entry => entry.sessionIds?.includes(sessionId))?.id ?? null
+  const projectOf = (entry, position) => ({
+    id: String(entry.id), name: entry.title || String(entry.path).split(/[\/]/u).filter(Boolean).at(-1) || 'Workspace',
+    roots: [{ path: entry.path }], metadata: {}, position, createdAt: seconds(entry.createdAt), updatedAt: seconds(entry.updatedAt),
+    recencyAt: entry.sessionIds?.length ? seconds(entry.updatedAt) : null,
+  })
+
+  /** Data URLs for the images in a conversation (newest first, bounded), so the phone can show them. */
+  const imageUrlsOf = async messages => {
+    const urls = new Map()
+    const store = attachments()
+    if (!store) return urls
+    const wanted = messages.flatMap(message => message.role === 'tool' || typedImages(message).length > 0 ? imageBlocks(message) : []).toReversed().slice(0, 12)
+    await Promise.all(wanted.map(async block => {
+      try {
+        const stored = await store.readImage(block.attachment, AbortSignal.timeout(10_000))
+        urls.set(block.attachment.attachmentId, `data:${stored.ref.mediaType};base64,${Buffer.from(stored.data).toString('base64')}`)
+      } catch { /* an image DSH can no longer read is simply not shown */ }
+    }))
+    return urls
+  }
+  /** The turn DSH is running, as the phone should see it now: what is committed, plus the reply still being written. */
+  // The phone merges items by id. A message it watched arrive keeps the id it was shown with when DSH's committed
+  // history is read back, otherwise the same message appears twice (or the live copy stays empty).
+  const aliases = new Map() // `${threadId}\0${committed id}` -> the id the phone was shown
+  const keepShownId = (threadId, committed, shown) => {
+    if (committed === shown) return
+    aliases.set(`${threadId}\0${committed}`, shown)
+    if (aliases.size > 2000) aliases.delete(aliases.keys().next().value)
+  }
+  const withShownIds = (id, turns) => aliases.size === 0 ? turns : turns.map(turn => ({ ...turn, items: turn.items.map(item => aliases.has(`${id}\0${item.id}`) ? { ...item, id: aliases.get(`${id}\0${item.id}`) } : item) }))
+  const withLiveTurn = (id, shownTurns) => {
+    const turns = withShownIds(id, shownTurns)
+    const live = active.get(id)
+    if (!live) return turns
+    const typed = item => (item?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('')
+    const writing = streams.get(id)
+    const tail = writing ? [{ ...writing.item, text: writing.text }] : []
+    const last = turns.at(-1)
+    const ours = last?.items[0]?.type === 'userMessage' && typed(last.items[0]) === typed(live.userItem)
+    const items = ours ? [live.userItem, ...last.items.slice(1), ...tail] : [live.userItem, ...tail]
+    return [...(ours ? turns.slice(0, -1) : turns), { ...live.turn, items, status: 'inProgress', error: null, completedAt: null, durationMs: null }]
+  }
+  const openThread = async (id, notify) => {
+    const agent = await agentFor(id)
+    if (notify) subscribe(id, notify)
+    await (catalog ? undefined : loadCatalog().catch(() => undefined))
+    const session = agent.session
+    const messages = session.deriveMessages()
+    const first = messages.find(message => typedText(message) !== '')
+    const imageUrls = await imageUrlsOf(messages)
+    const cwd = directoryOf(session)
+    return {
+      agent,
+      thread: thread({
+        id, cwd, createdAt: session.meta?.createdAt, running: active.has(id), projectId: projectIdOf(id), threadSource: threadSources.get(id),
+        preview: first ? visibleText(first.content).slice(0, 200) : '', turns: withLiveTurn(id, projectTurns(messages, session.meta?.createdAt, imageUrls, cwd)),
+      }),
+    }
+  }
+  /** Apply a model or effort the phone picked; DSH validates it against its own catalog. */
+  // Speed: the plugin keeps one speed setting (standard, fast, ultrafast); the phone's service tier is that setting.
+  const TIER_OF = { fast: 'priority', ultrafast: 'ultrafast' }
+  const MODE_OF = { priority: 'fast', fast: 'fast', ultrafast: 'ultrafast', default: 'standard' }
+  const tiersOf = (provider, model) => { try { return speed?.tiers?.(provider, model) ?? [] } catch { return [] } }
+  const shownTier = () => { try { return TIER_OF[speed?.current?.()] ?? null } catch { return null } }
+  /** A tier the phone picked: a string id, "default" or null for standard speed; undefined leaves the setting alone. */
+  const applySpeed = async tier => {
+    if (tier === undefined || !speed?.set) return
+    const mode = tier === null ? 'standard' : MODE_OF[tier]
+    if (mode === undefined || mode === speed.current?.()) return
+    await speed.set(mode)
+  }
+  const applySelection = async (agent, sessionId, params) => {
+    const picked = parseModelKey(params?.model)
+    const effort = typeof params?.effort === 'string' ? params.effort : undefined
+    if (!picked && effort === undefined) return
+    const current = selection(agent) ?? {}
+    const next = { provider: picked?.provider ?? current.provider, model: picked?.model ?? current.model, ...(effort ?? current.reasoningEffort ? { reasoningEffort: effort ?? current.reasoningEffort } : {}) }
+    if (!next.provider || !next.model) return
+    if (next.provider === current.provider && next.model === current.model && next.reasoningEffort === current.reasoningEffort) return
+    await service().selectModel({ sessionId, ...next })
+    pickedBy.set(sessionId, { selection: next, was: recorded(agent) })
+  }
+
+  // DSH permission presets <-> Codex sandbox/approval: workspace-write and full access.
+  const presetOf = session => { try { return permissions()?.current?.(session) } catch { return undefined } }
+  const sandboxFor = (preset, cwd) => preset === 'danger-full-access' || preset === 'auto'
+    ? { type: 'dangerFullAccess' }
+    : { type: 'workspaceWrite', writableRoots: cwd ? [cwd] : [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+  const applyPermissions = (agent, params) => {
+    const type = params?.sandboxPolicy?.type ?? (typeof params?.sandbox === 'string' ? params.sandbox : undefined)
+    const preset = type === 'dangerFullAccess' || type === 'danger-full-access' ? 'danger-full-access'
+      : type === 'workspaceWrite' || type === 'workspace-write' ? 'workspace-write' : undefined
+    if (!preset || !agent?.session || presetOf(agent.session) === preset) return
+    permissions()?.set?.(agent.session, preset)
+  }
+
+  // Throwaway title threads: a short title from the message the person just sent, no model call.
+  const titles = new Map() // threadId -> createdAt
+  const lastPrompt = { text: '' }
+  const titleThread = params => {
+    const id = `ephemeral-${randomUUID()}`
+    titles.set(id, Date.now())
+    for (const [key, at] of titles) if (Date.now() - at > 600_000) titles.delete(key)
+    return { ...settings(undefined, ''), thread: { ...thread({ id, cwd: '', createdAt: Date.now() }), ephemeral: true, modelProvider: 'dsh' } }
+  }
+  const titleTurn = async (params, notify) => {
+    const source = lastPrompt.text || inputText(params?.input).split(/\n\s*\n/u).map(part => part.trim()).filter(Boolean).at(-1) || 'DSH'
+    const title = source.split('\n')[0].trim().slice(0, 36)
+    const turn = { ...emptyTurn(), status: 'completed', completedAt: seconds(Date.now()) }
+    const item = { type: 'agentMessage', id: randomUUID(), text: title, phase: null, memoryCitation: null, delivery: null }
+    turn.items.push(item)
+    const threadId = params.threadId
+    titles.delete(threadId)
+    queueMicrotask(() => {
+      void notify('turn/started', { threadId, turn: { ...turn, items: [], status: 'inProgress', completedAt: null } }).catch(() => {})
+      void notify('item/completed', { threadId, turnId: turn.id, item, completedAtMs: Date.now() }).catch(() => {})
+      void notify('turn/completed', { threadId, turn }).catch(() => {})
+    })
+    return { turn: { ...turn, items: [], status: 'inProgress', completedAt: null } }
+  }
+
+  /** Message content for DSH from what the phone sent: its text plus any inline images (DSH admits and stores them itself). */
+  const contentOf = input => {
+    const text = [...skillGestures(input), inputText(input)].filter(Boolean).join(' ')
+    const pictures = inputImages(input)
+    if (text === '' && pictures.length === 0) throw invalidParams('Send some text or an image')
+    if (pictures.length > MAX_PHONE_IMAGES) throw invalidParams(`At most ${MAX_PHONE_IMAGES} images per message`)
+    const images = pictures.map(picture => {
+      const image = dataImage(picture.url)
+      if (!image) throw invalidParams('Only images sent inline are supported')
+      return { type: 'image', data: Buffer.from(image.data).toString('base64'), mediaType: image.mediaType, name: 'phone-image' }
+    })
+    return { text, pictures, content: [...(text === '' ? [] : [{ type: 'text', text }]), ...images] }
+  }
+
+  async function startTurn(params, notify) {
+    const { text, pictures, content } = contentOf(params?.input)
+    lastPrompt.text = text
+    const id = params?.threadId
+    const agent = await agentFor(id)
+    if (active.has(id)) throw new RpcError(-32602, 'A turn is already running in this conversation')
+    subscribe(id, notify)
+    await applySelection(agent, id, params)
+    applyPermissions(agent, params)
+    // serviceTier sticks like the model; serviceTierForTurn is for this turn only and is put back afterwards.
+    const speedBefore = speed?.current?.()
+    const speedForTurn = typeof params?.serviceTierForTurn === 'string' ? params.serviceTierForTurn : undefined
+    await applySpeed(speedForTurn ?? (Object.hasOwn(params ?? {}, 'serviceTier') ? params.serviceTier : undefined))
+    const turn = emptyTurn()
+    const userItem = { type: 'userMessage', id: params.clientUserMessageId ?? randomUUID(), clientId: params.clientUserMessageId ?? null, content: [...(text === '' ? [] : [{ type: 'text', text, text_elements: [] }]), ...pictures.map(picture => ({ type: 'image', url: picture.url }))] }
+    active.set(id, { turn, ended: undefined, userItem })
+    emit(id, 'turn/started', { threadId: id, turn })
+    turn.items.push(userItem)
+    emit(id, 'thread/status/changed', { threadId: id, status: { type: 'active', activeFlags: [] } })
+    emit(id, 'item/started', { threadId: id, turnId: turn.id, item: userItem, startedAtMs: Date.now() })
+    emit(id, 'item/completed', { threadId: id, turnId: turn.id, item: userItem, completedAtMs: Date.now() })
+    try {
+      await service().prompt({ requestId: randomUUID(), sessionId: id, mode: 'queue', content }, AbortSignal.timeout(30_000))
+    } catch (error) {
+      active.delete(id)
+      throw new RpcError(-32603, error?.message ? `DSH did not accept the message: ${String(error.message).slice(0, 200)}` : 'DSH did not accept the message')
+    }
+    void Promise.resolve(agent.whenIdle?.()).catch(() => {}).then(() => {
+      // Report how DSH closed the turn, so model or credential failures reach the phone.
+      const reason = active.get(id)?.ended
+      turn.status = reason?.kind === 'error' ? 'failed' : reason?.kind === 'aborted' || reason?.kind === 'interrupted' ? 'interrupted' : 'completed'
+      if (reason?.kind === 'error') {
+        const message = String(reason.error?.message ?? reason.error?.code ?? 'The model request failed').slice(0, 500)
+        turn.error = { message, codexErrorInfo: null, additionalDetails: null }
+        emit(id, 'error', { threadId: id, turnId: turn.id, willRetry: false, error: turn.error })
+      }
+      turn.completedAt = seconds(Date.now())
+      if (speedForTurn !== undefined && speedBefore !== undefined && speed?.current?.() !== speedBefore) void Promise.resolve(speed.set?.(speedBefore)).catch(() => {})
+      // The phone was shown this message under its own id; keep that id once DSH has committed it.
+      const sentText = visibleText(userItem.content.filter(part => part.type === 'text'))
+      try {
+        const committedUser = agent.session.deriveMessages().findLast(message => typedText(message) !== '' && typedText(message) === sentText)
+        if (committedUser) keepShownId(id, committedUser.id, userItem.id)
+      } catch { /* the phone then simply reads DSH's own id */ }
+      active.delete(id)
+      compactions.delete(id)
+      const usageNow = tokenUsage(agent.session)
+      if (usageNow) emit(id, 'thread/tokenUsage/updated', { threadId: id, turnId: turn.id, tokenUsage: usageNow })
+      emit(id, 'turn/completed', { threadId: id, turn })
+      emit(id, 'thread/status/changed', { threadId: id, status: { type: 'idle' } })
+      const [next, ...rest] = queues.get(id) ?? []
+      if (next) {
+        queues.set(id, rest)
+        emit(id, 'thread/queue/changed', { threadId: id })
+        void startTurn({ threadId: id, input: next.input, clientUserMessageId: next.clientUserMessageId }, notify).catch(() => {})
+      }
+    })
+    return { turn }
+  }
+
+  /** Conversations the phone may see, filtered the way it asks, plus the passages DSH found for a search term. */
+  const listed = async (params, signal) => {
+    const value = await service().list({}, signal)
+    const archived = new Set(workspaces()?.archivedSessionIds ?? [])
+    const wantArchived = params?.archived === true
+    const excluded = new Set(Array.isArray(params?.excludedThreadIds) ? params.excludedThreadIds : [])
+    const folders = [params?.cwd].flat().filter(entry => typeof entry === 'string')
+    const members = typeof params?.projectId === 'string' ? new Set(workspaceList().find(entry => String(entry.id) === params.projectId)?.sessionIds ?? []) : undefined
+    const term = typeof params?.searchTerm === 'string' ? params.searchTerm.trim() : ''
+    // DSH searches the messages themselves; a deployment without the search service still matches titles.
+    const snippets = new Map()
+    if (term !== '') {
+      try { for (const hit of (await service().search({ query: term }, signal)).items ?? []) snippets.set(hit.sessionId, hit.snippet) } catch (error) { trace({ method: 'thread/search:unavailable', reason: String(error?.message ?? error).slice(0, 160) }) /* title matching below still works */ }
+    }
+    const threads = (value.items ?? [])
+      .filter(item => item.origin !== 'subagent' && !item.blank && archived.has(item.sessionId) === wantArchived && !excluded.has(item.sessionId)
+        && (folders.length === 0 || folders.includes(item.cwd)) && (members === undefined || members.has(item.sessionId)))
+      .map(item => thread({
+        id: item.sessionId, cwd: item.cwd, createdAt: item.updatedAt, updatedAt: item.updatedAt, projectId: projectIdOf(item.sessionId),
+        running: item.running, title: item.projections?.values?.title ?? null,
+      }))
+    return { threads, snippets }
+  }
+  const matches = (entry, term, snippets) => {
+    const needle = typeof term === 'string' ? term.trim().toLocaleLowerCase() : ''
+    return needle === '' || snippets.has(entry.id) || `${entry.name ?? ''} ${entry.preview}`.toLocaleLowerCase().includes(needle)
+  }
+
+  /** Run a request the voice model handed over as a turn, and pass each message the agent finishes back to it. */
+  const delegateToAgent = async (threadId, text, onMessage) => {
+    for (let waited = 0; active.has(threadId) && waited < 600_000; waited += 500) await new Promise(resolve => setTimeout(resolve, 500))
+    let finish
+    const finished = new Promise(resolve => { finish = resolve })
+    const observer = async (method, params) => {
+      if (params?.threadId !== threadId) return
+      if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string' && params.item.text.trim() !== '') onMessage(params.item.text)
+      else if (method === 'turn/completed') finish()
+    }
+    try {
+      await startTurn({ threadId, input: [{ type: 'text', text, text_elements: [] }] }, observer)
+      await finished
+    } finally {
+      subscribers.get(threadId)?.delete(observer)
+    }
+  }
+  /** Leave text in the conversation's context for its next message, without starting a turn. */
+  const recordToAgent = async (threadId, text) => {
+    const agent = await agentFor(threadId)
+    if (typeof agent.inject !== 'function') return
+    agent.inject({ id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
+  }
+  const realtimeVoice = voice ? createRealtimeVoice({ ...voice, userAgent, log: diagnosticLog, delegate: delegateToAgent, record: recordToAgent }) : undefined
+
+  const phoneConfig = createPhoneConfig(configFile)
+
+  const methods = {
+    initialize: () => ({
+      codexHome: '', platformFamily: process.platform === 'win32' ? 'windows' : 'unix',
+      platformOs: ({ darwin: 'macos', win32: 'windows' })[process.platform] ?? process.platform, userAgent: appServerUserAgent,
+    }),
+    'account/read': async () => ({ account: { type: 'chatgpt', email: null, planType: (await usage()?.read?.().catch(() => undefined))?.planType ?? 'unknown' }, requiresOpenaiAuth: false }),
+    'modelProvider/capabilities/read': () => ({ imageGeneration: false, namespaceTools: false, webSearch: false }),
+    'model/list': async () => {
+      const value = await loadCatalog()
+      const defaultKey = value.default ? modelKey(value.default) : undefined
+      const data = []
+      for (const group of value.groups ?? []) {
+        const modalities = new Map(await Promise.all((group.models ?? []).map(async model => {
+          // The phone only offers photo attachments for a model that says it reads images.
+          const info = await Promise.resolve(llm()?.resolveModelInfo?.(group.id, model.id)).catch(() => undefined)
+          return [model.id, (Array.isArray(info?.inputModalities) ? info.inputModalities : ['text']).filter(kind => kind === 'text' || kind === 'image')]
+        })))
+        for (const model of group.models ?? []) {
+          const key = modelKey({ provider: group.id, model: model.id })
+          const efforts = (model.reasoning?.efforts ?? []).map(effort => ({ reasoningEffort: effort.id, description: effort.name ?? effort.id }))
+          const supported = efforts.length > 0 ? efforts : [{ reasoningEffort: 'medium', description: 'Default' }]
+          data.push({
+            id: key, model: key, displayName: model.name ?? model.id, description: group.name ?? '', hidden: false, isDefault: key === defaultKey,
+            supportedReasoningEfforts: supported, defaultReasoningEffort: model.reasoning?.defaultEffort ?? supported[0].reasoningEffort,
+            inputModalities: modalities.get(model.id)?.length ? modalities.get(model.id) : ['text'], supportsPersonality: false, additionalSpeedTiers: tiersOf(group.id, model.id).map(tier => tier.id), upgrade: null, upgradeInfo: null, availabilityNux: null, serviceTiers: tiersOf(group.id, model.id), defaultServiceTier: null,
+          })
+        }
+      }
+      return { data, nextCursor: null }
+    },
+    'configRequirements/read': () => ({ requirements: { allowedSandboxModes: ['workspace-write', 'danger-full-access'], allowedApprovalPolicies: ['on-request', 'never'], allowRemoteControl: true } }),
+    'thread/settings/update': async params => {
+      const agent = await agentFor(params?.threadId)
+      await applySelection(agent, params.threadId, params)
+      applyPermissions(agent, params)
+      if (Object.hasOwn(params ?? {}, 'serviceTier')) await applySpeed(params.serviceTier)
+      return {}
+    },
+    'thread/attachment/list': () => ({ data: [], nextCursor: null }),
+    // The phone keeps its defaults (model, effort, speed, permissions) in the host's config and reads them back with config/read.
+    'config/batchWrite': params => {
+      phoneConfig.write(params?.edits)
+      return { status: 'ok', version: '1', filePath: process.platform === 'win32' ? 'C:\dsh\config.toml' : '/dsh/config.toml', overriddenMetadata: null }
+    },
+    // Arbitrary host commands bypass DSH's sandbox and approvals, so they stay off.
+    // Only read-only git inside a conversation folder, for the phone's changes view; nothing else runs.
+    'command/exec': async (params, { notify, signal }) => {
+      const home = homeFolderAnswer(params?.command)
+      if (home !== undefined) return home
+      const folders = await conversationFolders()
+      try { return phoneGitProbe(params?.command) ? await runPhoneGitProbe(params, { folders, notify, signal }) : await runGit(params, { folders }) } catch (error) {
+        trace({ method: 'command/exec:refused', reason: String(error?.message).slice(0, 80), command: Array.isArray(params?.command) ? params.command.slice(0, 3).map(part => String(part).slice(0, 40)) : null })
+        throw new RpcError(-32600, error?.code === 'not-allowed' ? `Not available on a DSH host: ${error.message}` : 'Could not run the command')
+      }
+    },
+    'plugin/installed': () => ({ marketplaceLoadErrors: [], marketplaces: [] }),
+    // The app prepares a working folder before a new chat; sessions here use DSH's own folders, so nothing is created.
+    'fs/createDirectory': () => ({}),
+    'fs/getMetadata': params => realMetadata(params?.path) ?? ({ isDirectory: true, isFile: false, isSymlink: false, createdAtMs: Date.now(), modifiedAtMs: Date.now() }),
+    'fs/readDirectory': params => ({ entries: readFolder(params?.path) }),
+    'collaborationMode/list': () => ({ data: [] }),
+    // Live voice is not available through a DSH host yet. Answer the phone's voice calls instead of
+    // leaving it on "connecting": list the voices, then end a start attempt with a clear error.
+    'thread/realtime/listVoices': () => {
+      // Development only: ask the backend for a call the way the phone's next step does, and log its answer.
+      return { voices: REALTIME_VOICES }
+    },
+    'thread/realtime/start': async (params, { notify }) => {
+      const threadId = typeof params?.threadId === 'string' ? params.threadId : ''
+      const fail = message => {
+        setTimeout(() => {
+          void notify('thread/realtime/error', { threadId, message }).catch(() => {})
+          void notify('thread/realtime/closed', { threadId, reason: 'error' }).catch(() => {})
+        }, 50)
+        return {}
+      }
+      if (!realtimeVoice) return fail('Live voice is not available on this DSH')
+      subscribe(threadId, notify)
+      // Joining the call takes a moment; the phone is told when it is joined, or why it was not.
+      void realtimeVoice.start(params, notify).catch(error => {
+        diagnosticLog.error('voice', 'live voice could not start', String(error?.message ?? error))
+        void notify('thread/realtime/error', { threadId, message: 'Live voice could not connect to the voice service' }).catch(() => {})
+        void notify('thread/realtime/closed', { threadId, reason: 'error' }).catch(() => {})
+      })
+      return {}
+    },
+    'thread/realtime/stop': params => { realtimeVoice?.stop(params?.threadId); return {} },
+    'thread/realtime/appendText': params => { realtimeVoice?.appendText(params?.threadId, params?.text); return {} },
+    'thread/realtime/appendSpeech': params => { realtimeVoice?.appendSpeech(params?.threadId, params?.text); return {} },
+    'permissionProfile/list': () => ({ data: [], nextCursor: null }),
+    'threadSection/list': () => ({ data: [], nextCursor: null }),
+    'thread/goal/get': () => ({ goal: null }),
+    'experimentalFeature/list': () => ({ data: [], nextCursor: null }),
+    'config/read': () => ({ config: phoneConfig.read(), origins: {}, layers: null }),
+    'thread/loaded/list': () => ({ data: [...subscribers.keys()], nextCursor: null }),
+    'thread/unsubscribe': () => ({ status: 'notSubscribed' }),
+    'thread/list': async (params, { signal }) => {
+      const { threads, snippets } = await listed(params, signal)
+      return page(threads.filter(entry => matches(entry, params?.searchTerm, snippets)), params)
+    },
+    // Full-text search: conversations whose title or messages contain the term, each with the passage that matched.
+    'thread/search': async (params, { signal }) => {
+      const term = String(params?.searchTerm ?? '').trim()
+      if (term === '') throw invalidParams('searchTerm is required')
+      const { threads, snippets } = await listed(params, signal)
+      const hits = threads.filter(entry => matches(entry, term, snippets)).map(entry => ({ thread: entry, snippet: snippets.get(entry.id) ?? entry.name ?? entry.preview }))
+      return page(hits, params)
+    },
+    // Matches inside one conversation, so the phone can jump to the message.
+    'thread/searchOccurrences': async params => {
+      const term = String(params?.searchTerm ?? '').trim()
+      if (term === '') throw invalidParams('searchTerm is required')
+      const { thread: value } = await openThread(params?.threadId)
+      const found = []
+      for (const [position, turn] of value.turns.entries()) {
+        for (const item of turn.items) {
+          const text = item.type === 'userMessage' ? item.content.map(part => part.text ?? '').join('\n') : item.type === 'agentMessage' ? item.text : ''
+          const hit = occurrence(text, term)
+          if (hit) found.push({ turnId: turn.id, itemId: item.id, ...hit, turnCursor: String(value.turns.length - 1 - position) })
+        }
+      }
+      const { data, nextCursor } = page(found, params)
+      return { data, nextCursor }
+    },
+    'project/list': (params) => page(workspaceList().map(projectOf), params),
+    'project/read': async params => {
+      const list = workspaceList()
+      const index = list.findIndex(entry => String(entry.id) === params?.projectId)
+      if (index < 0) throw new RpcError(-32602, `Project not found: ${String(params?.projectId).slice(0, 80)}`)
+      return { project: projectOf(list[index], index) }
+    },
+    // The same personal usage figures the official /usage dashboard shows, from the account's usage profile.
+    'account/usage/read': async () => {
+      const profile = await usageProfile()?.read?.().catch(() => undefined)
+      const known = profile && profile.available !== false ? profile : undefined
+      return {
+        summary: {
+          lifetimeTokens: known?.lifetimeTokens ?? null, peakDailyTokens: known?.peakDailyTokens ?? null, longestRunningTurnSec: known?.longestRunningTurnSeconds ?? null,
+          currentStreakDays: known?.currentStreakDays ?? null, longestStreakDays: known?.longestStreakDays ?? null,
+        },
+        dailyUsageBuckets: known ? known.days.map(day => ({ startDate: day.date, tokens: day.tokens })) : null,
+      }
+    },
+    'currentTime/read': () => ({ currentTimeAt: seconds(Date.now()) }),
+    'account/rateLimits/read': async () => rateLimits(await usage()?.read?.().catch(() => undefined)),
+    'thread/turns/list': async params => {
+      const { thread: value } = await openThread(params?.threadId)
+      const ordered = params?.sortDirection === 'asc' ? value.turns : value.turns.toReversed()
+      return { ...page(ordered, params), backwardsCursor: ordered.length ? String(0) : null }
+    },
+    'thread/fork': async (params, { notify }) => {
+      const forked = await service().fork({ sessionId: params?.threadId })
+      const agent = await agentFor(forked.sessionId)
+      await applySelection(agent, forked.sessionId, params)
+      const { thread: value } = await openThread(forked.sessionId, notify)
+      emit(forked.sessionId, 'thread/started', { thread: value })
+      return { ...settings(agent, value.cwd), thread: value }
+    },
+    'thread/readState/update': () => ({}),
+    // @-mentions: files under a conversation folder, once or as a typing session the phone updates.
+    fuzzyFileSearch: async params => ({ files: await searchFiles({ roots: params?.roots ?? [], query: String(params?.query ?? ''), folders: await conversationFolders() }) }),
+    'fuzzyFileSearch/sessionStart': (params, { notify }) => { searches.set(params?.sessionId, { roots: params?.roots ?? [], notify }); return {} },
+    'fuzzyFileSearch/sessionUpdate': async params => {
+      const search = searches.get(params?.sessionId)
+      if (search) {
+        const query = String(params?.query ?? '')
+        const files = await searchFiles({ roots: search.roots, query, folders: await conversationFolders() })
+        void search.notify('fuzzyFileSearch/sessionUpdated', { sessionId: params.sessionId, query, files }).catch(() => {})
+        void search.notify('fuzzyFileSearch/sessionCompleted', { sessionId: params.sessionId }).catch(() => {})
+      }
+      return {}
+    },
+    'fuzzyFileSearch/sessionStop': params => { searches.delete(params?.sessionId); return {} },
+    // DSH skills the person may invoke (a /name gesture), listed per folder the way the phone asks.
+    'skills/list': async (params, { signal }) => {
+      const registry = skills()
+      const folders = Array.isArray(params?.cwds) && params.cwds.length > 0 ? params.cwds : [workspaceList()[0]?.path ?? '']
+      return { data: await Promise.all(folders.map(async cwd => {
+        try {
+          const found = (await registry?.list?.({ cwd: cwd || undefined, signal }) ?? []).filter(skill => skill?.invocation?.userInvocable !== false)
+          return { cwd, errors: [], skills: found.map(skill => ({ name: skill.name, description: skill.description ?? '', shortDescription: null, interface: null, dependencies: null, path: skill.path ?? skill.name, scope: 'user', enabled: true, pluginId: null })) }
+        } catch { return { cwd, skills: [], errors: [] } }
+      })) }
+    },
+    // Archiving is DSH's registry-wide archive set, the same one the desktop sidebar uses.
+    'thread/archive': async params => {
+      const registry = workspaces()
+      if (!registry) throw new RpcError(-32603, 'DSH archive is unavailable in this profile')
+      try { await registry.archiveSession(params?.threadId, { stopActivity: true }) } catch { throw notFound(params?.threadId) }
+      active.delete(params?.threadId)
+      return {}
+    },
+    'thread/unarchive': async params => {
+      const registry = workspaces()
+      if (!registry) throw new RpcError(-32603, 'DSH archive is unavailable in this profile')
+      await registry.unarchiveSession(params?.threadId)
+      return { thread: (await openThread(params?.threadId)).thread }
+    },
+    'thread/read': async params => ({ thread: (await openThread(params?.threadId)).thread }),
+    'thread/resume': async (params, { notify }) => {
+      const { agent, thread: value } = await openThread(params?.threadId, notify)
+      return { ...settings(agent, value.cwd), thread: value }
+    },
+    'thread/start': async (params, { notify }) => {
+      // The app asks the host to title a new chat in a throwaway thread; answer it here instead of opening a DSH session.
+      if (params?.ephemeral === true) return titleThread(params)
+      // The app sends a folder it made up under its own home ("/Documents/Codex/<date>/new-chat"); only a real local folder is used.
+      const cwd = localFolder(params?.cwd)
+      const project = typeof params?.projectId === 'string' ? workspaceList().find(entry => String(entry.id) === params.projectId) : undefined
+      // A phone that names only the folder of a workspace still files the chat under that workspace (the folder itself, not one inside it).
+      const workspace = !project && cwd ? workspaceList().find(entry => samePath(entry.path, cwd)) : undefined
+      let created
+      if (project) created = await service().create({ workspaceId: project.id })
+      else if (workspace) {
+        // DSH compares the folders more strictly when it attaches. When it refuses, the session already exists in the
+        // workspace folder (DSH says which one), so keep it rather than creating a second, orphaned chat.
+        try { created = await service().create({ workspaceId: workspace.id }) } catch (error) {
+          const made = error?.details?.sessionId
+          created = typeof made === 'string' && made !== '' ? { sessionId: made } : await service().create({ cwd })
+        }
+      } else created = await service().create(cwd ? { cwd } : {})
+      if (typeof params?.threadSource === 'string' && params.threadSource !== '') threadSources.set(created.sessionId, params.threadSource.slice(0, 64))
+      const agent = await agentFor(created.sessionId)
+      // A new chat that names no model starts with the model and effort the phone last saved.
+      const saved = phoneConfig.read()
+      await applySelection(agent, created.sessionId, { ...params, model: params?.model ?? saved.model, effort: params?.effort ?? saved.model_reasoning_effort })
+      const { thread: value } = await openThread(created.sessionId, notify)
+      emit(created.sessionId, 'thread/started', { thread: value })
+      return { ...settings(agent, value.cwd), thread: value }
+    },
+    'turn/start': (params, { notify }) => titles.has(params?.threadId) ? titleTurn(params, notify) : startTurn(params, notify),
+    'turn/interrupt': params => { service().cancel({ sessionId: params?.threadId }); active.get(params?.threadId)?.abort?.abort(); return {} },
+    // DSH's /compact (0.2.0-rc.2 and later): condense the older history now. It is a turn of its own, like the app's.
+    'thread/compact/start': async (params, { notify }) => {
+      const id = params?.threadId
+      const registry = commands()
+      const agent = await agentFor(id)
+      // The same /compact the Web app runs, so it answers with DSH's own wording and keeps the session log in step.
+      if (typeof registry?.execute !== 'function' || registry.find?.(agent, 'compact') === undefined) throw new RpcError(-32601, 'This DSH version cannot compact a conversation on request')
+      if (active.has(id)) throw new RpcError(-32602, 'A turn is already running in this conversation')
+      subscribe(id, notify)
+      const turn = emptyTurn()
+      const abort = new AbortController()
+      active.set(id, { turn, ended: undefined, abort })
+      emit(id, 'turn/started', { threadId: id, turn })
+      emit(id, 'thread/status/changed', { threadId: id, status: { type: 'active', activeFlags: [] } })
+      void (async () => {
+        try {
+          const execution = await registry.execute(agent, '/compact', [], abort.signal)
+          const result = execution?.result
+          if (result?.kind === 'error') throw new Error(result.text || 'Compaction failed')
+          // DSH reports real work with the summary's position; a DSH that skips the start/end events still shows the app its "context compacted" row.
+          if (result?.sourceEventSeq !== undefined && turn.items.length === 0) {
+            const item = { type: 'contextCompaction', id: randomUUID() }
+            turn.items.push(item)
+            emit(id, 'item/started', { threadId: id, turnId: turn.id, item, startedAtMs: Date.now() })
+            emit(id, 'item/completed', { threadId: id, turnId: turn.id, item, completedAtMs: Date.now() })
+          }
+          turn.status = 'completed'
+        } catch (error) {
+          turn.status = abort.signal.aborted ? 'interrupted' : 'failed'
+          if (turn.status === 'failed') {
+            turn.error = { message: String(error?.message ?? 'Compaction failed').slice(0, 500), codexErrorInfo: null, additionalDetails: null }
+            emit(id, 'error', { threadId: id, turnId: turn.id, willRetry: false, error: turn.error })
+          }
+        }
+        turn.completedAt = seconds(Date.now())
+        active.delete(id)
+        compactions.delete(id)
+        const usageNow = tokenUsage(agent.session)
+        if (usageNow) emit(id, 'thread/tokenUsage/updated', { threadId: id, turnId: turn.id, tokenUsage: usageNow })
+        emit(id, 'turn/completed', { threadId: id, turn })
+        emit(id, 'thread/status/changed', { threadId: id, status: { type: 'idle' } })
+      })()
+      return {}
+    },
+    'turn/steer': async params => {
+      const { content } = contentOf(params?.input)
+      await service().prompt({ requestId: randomUUID(), sessionId: params?.threadId, mode: 'steer', content }, AbortSignal.timeout(30_000))
+      return { turnId: params?.expectedTurnId ?? active.get(params?.threadId)?.turn.id ?? '' }
+    },
+    'thread/name/set': async params => {
+      await service().rename({ sessionId: params?.threadId, title: String(params?.name ?? '') })
+      emit(params?.threadId, 'thread/name/updated', { threadId: params?.threadId, threadName: String(params?.name ?? '') })
+      return {}
+    },
+    'thread/queue/list': params => ({ data: queues.get(params?.threadId) ?? [], nextCursor: null }),
+    'thread/queue/add': async (params, { notify }) => {
+      if (!Array.isArray(params?.input)) throw invalidParams('input is required')
+      const id = params?.threadId
+      const queued = { id: randomUUID(), clientUserMessageId: String(params.clientUserMessageId ?? randomUUID()), input: params.input }
+      subscribe(id, notify)
+      if (!active.has(id)) await startTurn({ threadId: id, input: queued.input, clientUserMessageId: queued.clientUserMessageId, model: params.model, effort: params.effort }, notify)
+      else {
+        queues.set(id, [...(queues.get(id) ?? []), queued])
+        emit(id, 'thread/queue/changed', { threadId: id })
+      }
+      return { queuedSubmission: queued }
+    },
+    'thread/queue/delete': params => {
+      const list = queues.get(params?.threadId) ?? []
+      const next = list.filter(entry => entry.id !== params?.queuedSubmissionId)
+      queues.set(params?.threadId, next)
+      if (next.length !== list.length) emit(params?.threadId, 'thread/queue/changed', { threadId: params?.threadId })
+      return { deleted: next.length !== list.length }
+    },
+    'thread/queue/reorder': params => {
+      const order = Array.isArray(params?.queuedSubmissionIds) ? params.queuedSubmissionIds : []
+      const list = queues.get(params?.threadId) ?? []
+      queues.set(params?.threadId, [...order.map(id => list.find(entry => entry.id === id)).filter(Boolean), ...list.filter(entry => !order.includes(entry.id))])
+      emit(params?.threadId, 'thread/queue/changed', { threadId: params?.threadId })
+      return {}
+    },
+    'thread/queue/start': async (params, { notify }) => {
+      const list = queues.get(params?.threadId) ?? []
+      const queued = list.find(entry => params?.queuedSubmissionId == null || entry.id === params.queuedSubmissionId)
+      if (!queued) throw invalidParams('Nothing queued')
+      queues.set(params.threadId, list.filter(entry => entry !== queued))
+      emit(params.threadId, 'thread/queue/changed', { threadId: params.threadId })
+      return startTurn({ threadId: params.threadId, input: queued.input, clientUserMessageId: queued.clientUserMessageId }, notify)
+    },
+  }
+
+  const callOf = (session, callId) => {
+    for (const message of session.deriveMessages().toReversed()) {
+      if (message.role !== 'assistant') continue
+      const block = message.content.find(entry => entry.type === 'tool-call' && entry.id === callId)
+      if (block) return block
+    }
+    return undefined
+  }
+  const commandText = (session, request) => {
+    const call = request.callId ? callOf(session, request.callId) : undefined
+    const args = call ? parseArguments(call.arguments) : undefined
+    const shown = typeof args?.command === 'string' ? args.command : typeof args?.cmd === 'string' ? args.cmd : call ? `${call.name} ${JSON.stringify(args)}` : request.toolName
+    return String(shown).slice(0, 2000)
+  }
+  /**
+   * DSH approval answerer: while a phone drives a turn, it answers that turn's approvals.
+   * Without a phone (or if it drops) the request goes on to DSH's own prompt.
+   */
+  /** The phone driving this agent's running turn, when there is one. */
+  const phoneFor = request => {
+    const session = request.agent?.session
+    const running = session ? active.get(session.id) : undefined
+    const phone = session ? [...(subscribers.get(session.id) ?? [])].find(notify => typeof notify.ask === 'function') : undefined
+    return running && phone ? { session, running, phone } : undefined
+  }
+
+  /**
+   * Ask whichever phone drives the turn. A phone that drops (app switched away, network) gets the
+   * same request again when it reopens the thread within PHONE_RETURN_MS; otherwise DSH decides.
+   */
+  const askPhone = async (request, method, params) => {
+    const sessionId = request.agent.session.id
+    // The phone's thread list shows "waiting for you" while a request is open.
+    const flag = method === 'item/tool/requestUserInput' ? 'waitingOnUserInput' : 'waitingOnApproval'
+    emit(sessionId, 'thread/status/changed', { threadId: sessionId, status: { type: 'active', activeFlags: [flag] } })
+    try { return await asked(request, method, params, sessionId) } finally {
+      if (active.has(sessionId)) emit(sessionId, 'thread/status/changed', { threadId: sessionId, status: { type: 'active', activeFlags: [] } })
+    }
+  }
+  const asked = async (request, method, params, sessionId) => {
+    for (;;) {
+      const phone = phoneFor(request)?.phone
+      if (!phone) throw new RpcError(-32800, 'No phone')
+      try { return await phone.ask(method, params, request.signal) } catch (error) {
+        // Still connected means the phone itself failed the request; only a dropped phone is waited for.
+        if (request.signal?.aborted || !active.has(sessionId) || phoneFor(request)?.phone === phone) throw error
+        trace({ method: `wait:${method}`, session: sessionId })
+        if (!phoneFor(request) && !await phoneReturns(sessionId, phoneReturnMs, request.signal)) throw error
+      }
+    }
+  }
+
+  /** DSH's ask-user tool: show the questions on the phone that drives the turn, else leave them to DSH. */
+  const onQuestion = (request, next) => {
+    const threadId = request.agent?.session?.id
+    if (realtimeVoice?.active(threadId)) {
+      return realtimeVoice.askQuestion(threadId, request).catch(error => {
+        if (request.signal?.aborted) throw error
+        return next()
+      })
+    }
+    const found = phoneFor(request)
+    trace({ method: 'hook:user-questions', phone: Boolean(found), session: request.agent?.session?.id ?? null })
+    if (!found) return next()
+    const { session, running } = found
+    const labels = new Map(request.questions.map(question => [question.id, new Set((question.options ?? []).map(option => option.label))]))
+    return askPhone(request, 'item/tool/requestUserInput', {
+      threadId: session.id, turnId: running.turn.id, itemId: request.wait?.callId ?? randomUUID(), isBlocking: true,
+      questions: request.questions.map(question => ({
+        id: question.id, header: question.header ?? '', question: question.detail ? `${question.question}\n\n${question.detail}` : question.question,
+        isOther: true, isSecret: false,
+        options: question.options?.length ? question.options.map(option => ({ label: option.label, description: option.description ?? '' })) : null,
+      })),
+    }).then(
+      answer => ({
+        answers: request.questions.map(question => {
+          const given = Array.isArray(answer?.answers?.[question.id]?.answers) ? answer.answers[question.id].answers.map(String) : []
+          const known = labels.get(question.id)
+          const selected = given.filter(value => known.has(value))
+          const custom = given.filter(value => !known.has(value)).join('\n')
+          return { id: question.id, selected, ...(custom === '' ? {} : { custom }) }
+        }),
+      }),
+      () => next(),
+    )
+  }
+
+  const onApproval = (request, next) => {
+    const found = phoneFor(request)
+    trace({ method: 'hook:approval', phone: Boolean(found), session: request.agent?.session?.id ?? null })
+    if (!found) return next()
+    const { session, running } = found
+    const call = request.callId ? callOf(session, request.callId) : undefined
+    const reason = request.displayReason?.en ?? request.reason ?? null
+    const common = { threadId: session.id, turnId: running.turn.id, itemId: request.callId ?? randomUUID(), startedAtMs: Date.now() }
+    // A file edit is shown with the phone's diff view (the item the call already created); anything else as a command.
+    const asked = call && (call.name === 'edit' || call.name === 'write')
+      ? askPhone(request, 'item/fileChange/requestApproval', { ...common, reason, grantRoot: null })
+      : askPhone(request, 'item/commandExecution/requestApproval', {
+        ...common, command: commandText(session, request), cwd: directoryOf(session) ?? null, reason,
+        commandActions: [], availableDecisions: ['accept', 'decline', 'cancel'],
+      })
+    return asked.then(
+      answer => {
+        const decision = typeof answer?.decision === 'string' ? answer.decision : ''
+        return decision === 'accept' || decision === 'acceptForSession' ? 'allowed-once' : decision === 'cancel' ? 'cancelled' : 'rejected'
+      },
+      () => next(),
+    )
+  }
+
+  // Text the model is still writing, shown on the phone as it arrives; the committed message then completes the same item.
+  const streams = new Map() // threadId -> { item, text }
+  const compactions = new Map() // threadId -> the contextCompaction item DSH is writing
+  const onStream = (session, frame) => {
+    const running = session ? active.get(session.id) : undefined
+    if (!running || !subscribers.has(session.id)) return
+    const id = session.id
+    if (frame.type === 'start') { streams.delete(id); return }
+    if (frame.type === 'end') {
+      const stream = streams.get(id)
+      // A committed message completes the item itself; an abandoned or failed attempt must not leave it open.
+      if (stream && frame.outcome?.eventType !== 'assistant/message') {
+        streams.delete(id)
+        stream.item.text = stream.text
+        emit(id, 'item/completed', { threadId: id, turnId: running.turn.id, item: stream.item, completedAtMs: Date.now() })
+      }
+      return
+    }
+    const chunk = frame.chunk
+    if (chunk?.type !== 'text-delta' || typeof chunk.text !== 'string' || chunk.text === '') return
+    let stream = streams.get(id)
+    if (!stream) {
+      stream = { item: { type: 'agentMessage', id: randomUUID(), text: '', phase: null, memoryCitation: null, delivery: null }, text: '' }
+      streams.set(id, stream)
+      running.turn.items.push(stream.item)
+      emit(id, 'item/started', { threadId: id, turnId: running.turn.id, item: stream.item, startedAtMs: Date.now() })
+    }
+    stream.text += chunk.text
+    emit(id, 'item/agentMessage/delta', { threadId: id, turnId: running.turn.id, itemId: stream.item.id, delta: chunk.text })
+  }
+
+  /** Forward committed assistant and tool events of a phone-started turn as items. */
+  const onSessionEvent = (session, event) => {
+    // A new or renamed title (DSH writes one after the first reply) reaches every phone that has the thread open.
+    if (event.type === 'session/title' && typeof event.data?.title === 'string' && subscribers.has(session.id)) {
+      emit(session.id, 'thread/name/updated', { threadId: session.id, threadName: event.data.title })
+    }
+    const running = active.get(session.id)
+    if (!running || !subscribers.has(session.id)) return
+    if (event.type === 'turn/end') { running.ended = event.data?.reason; return }
+    // DSH shrinking a long conversation shows as the phone's "context compacted" row.
+    if (event.type === 'compaction/start' || event.type === 'compaction/end') {
+      const item = event.type === 'compaction/start' ? { type: 'contextCompaction', id: randomUUID() } : compactions.get(session.id)
+      if (!item) return
+      if (event.type === 'compaction/start') {
+        compactions.set(session.id, item)
+        running.turn.items.push(item)
+        emit(session.id, 'item/started', { threadId: session.id, turnId: running.turn.id, item, startedAtMs: Date.now() })
+      } else {
+        compactions.delete(session.id)
+        emit(session.id, 'item/completed', { threadId: session.id, turnId: running.turn.id, item, completedAtMs: Date.now() })
+      }
+      return
+    }
+    if (event.type !== 'assistant/message' && event.type !== 'tool/result') return
+    const message = session.deriveMessages().at(-1)
+    if (message?.role === 'tool') {
+      const item = running.turn.items.find(entry => entry.id === message.toolCallId && entry.type !== 'agentMessage')
+      if (item) {
+        const finish = imageUrls => {
+          finishTool(item, message, imageUrls)
+          emit(session.id, 'item/completed', { threadId: session.id, turnId: running.turn.id, item, completedAtMs: Date.now() })
+        }
+        // Pictures a tool returned (a generated image) are read first so the phone can show them.
+        if (imageBlocks(message).length > 0) void imageUrlsOf([message]).then(finish, () => finish(new Map()))
+        else finish(new Map())
+      }
+      return
+    }
+    if (!message || message.role !== 'assistant') return
+    const items = projectTurns([{ role: 'user', id: 'x', content: [{ type: 'text', text: 'x' }] }, message], undefined, undefined, directoryOf(session)).flatMap(turn => turn.items.slice(1))
+    const stream = streams.get(session.id)
+    streams.delete(session.id)
+    let reuse = stream?.item
+    // DSH's task list is the phone's plan view.
+    for (const block of message.content) {
+      if (block.type !== 'tool-call' || block.name !== 'todo_write') continue
+      const todos = parseArguments(block.arguments)?.todos
+      if (!Array.isArray(todos)) continue
+      const status = { pending: 'pending', in_progress: 'inProgress', completed: 'completed' }
+      emit(session.id, 'turn/plan/updated', { threadId: session.id, turnId: running.turn.id, explanation: null, plan: todos.filter(todo => typeof todo?.content === 'string').map(todo => ({ step: todo.content, status: status[todo.status] ?? 'pending' })) })
+    }
+    for (const item of items) {
+      if (reuse && item.type === 'agentMessage') {
+        // The text already on the phone: finish that item instead of showing the reply twice.
+        const shown = reuse
+        reuse = undefined
+        keepShownId(session.id, item.id, shown.id)
+        shown.text = item.text
+        emit(session.id, 'item/completed', { threadId: session.id, turnId: running.turn.id, item: shown, completedAtMs: Date.now() })
+        continue
+      }
+      running.turn.items.push(item)
+      emit(session.id, 'item/started', { threadId: session.id, turnId: running.turn.id, item, startedAtMs: Date.now() })
+      emit(session.id, 'item/completed', { threadId: session.id, turnId: running.turn.id, item, completedAtMs: Date.now() })
+    }
+  }
+
+  /**
+   * A phone that reconnects on a new stream (the app was closed or refreshed) carries on with the threads its
+   * earlier streams had open, so a running turn keeps reaching it even if the app does not reopen the thread.
+   */
+  const adopt = notify => {
+    if (!notify.clientId) return
+    const opened = openedBy.get(notify.clientId)
+    if (!opened) return
+    for (const [threadId, at] of opened) {
+      if (Date.now() - at > ADOPT_WITHIN_MS) { opened.delete(threadId); continue }
+      const set = subscribers.get(threadId)
+      if (!set) continue
+      for (const other of [...set]) if (other !== notify && other.clientId === notify.clientId) set.delete(other)
+      if (!set.has(notify)) subscribe(threadId, notify)
+    }
+  }
+  // The desktop's own voice call: the browser's offer becomes a call at ChatGPT, and this host joins that call the way it
+  // joins one the phone made, so spoken requests run as turns of the DSH session and the answers are spoken back.
+  const desktopVoice = realtimeVoice === undefined ? undefined : Object.freeze({
+    async start({ sessionId, sdp, voice: voiceName, language }) {
+      if (typeof sdp !== 'string' || !sdp.startsWith('v=0') || sdp.length > 64 * 1024) throw new RpcError(-32602, 'Invalid voice offer')
+      const agent = await agentFor(sessionId)
+      diagnosticLog.info('voice', 'the conversation can take a context note', String(typeof agent.inject === 'function'))
+      const session = {
+        audio: { output: { voice: typeof voiceName === 'string' && /^[a-z]{2,16}$/u.test(voiceName) ? voiceName : 'cove' } },
+        delegation: { type: 'client' }, instructions: desktopInstructions(language), model: 'gpt-live-1.1-codex',
+      }
+      const { callId, answer } = await createVoiceCall({ fetch: voice.fetch, credentials: voice.credentials, userAgent, sdp, session, threadId: sessionId })
+      await realtimeVoice.start({ threadId: sessionId, transport: { type: 'existingCall', callId }, flushTranscriptTailOnSessionEnd: true, silentTailRecord: true, hangUpOnGoodbye: true, version: 'v3' }, async () => {})
+      return { answer }
+    },
+    stop: sessionId => realtimeVoice.stop(sessionId),
+    interrupt: sessionId => realtimeVoice.interrupt(sessionId),
+    end: sessionId => realtimeVoice.requestClose(sessionId),
+    status: sessionId => realtimeVoice.status(sessionId),
+  })
+  return { methods, desktopVoice, onSessionEvent, onStream, onApproval, onQuestion, adopt, forget: notify => { for (const set of subscribers.values()) set.delete(notify) } }
+}
