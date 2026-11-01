@@ -266,7 +266,9 @@ test('subscription fast mode reaches only officially supported Codex model reque
     }
 
     await run('gpt-5.6-sol')
-    await run('gpt-5.3-codex-spark')
+    // pi-ai 1.4.0 no longer bundles gpt-5.3-codex-spark; gpt-6-luna ships in this
+    // release and likewise lacks official fast-mode support.
+    await run('gpt-6-luna')
     speedMode = 'standard'
     await run('gpt-5.6-sol')
 
@@ -293,7 +295,16 @@ test('output detail reaches only verbosity-capable Codex requests', async () => 
   }
   try {
     let outputVerbosity = 'high'
-    const provider = openaiCodexSubscriptionProvider({ resolveOutputVerbosity: () => outputVerbosity })
+    // pi-ai 1.4.0 no longer bundles gpt-5.3-codex-spark, so the negative case comes
+    // from the account catalog (the production source) marking a model not
+    // verbosity-capable. Like the production catalog, the stub merges onto the
+    // bundled descriptors so the models stay dispatchable.
+    const bundled = new Map(openaiCodexProvider().getModels().map(model => [model.id, model]))
+    const catalog = {
+      getModels: () => ['gpt-5.6-sol', 'gpt-6-luna'].map(id => bundled.get(id)),
+      metadata: id => id === 'gpt-6-luna' ? { supportVerbosity: false } : undefined,
+    }
+    const provider = openaiCodexSubscriptionProvider({ resolveOutputVerbosity: () => outputVerbosity, catalog })
     const profiles = new Map([['openai-codex', {
       provider: 'openai-codex', displayName: 'ChatGPT subscription', piProvider: provider,
       configuredMaxTokens: new Map(), modelErrors: new Map(), transport: 'sse', streamIdleTimeoutMs: 10_000,
@@ -307,10 +318,10 @@ test('output detail reaches only verbosity-capable Codex requests', async () => 
     await run('gpt-5.6-sol')
     outputVerbosity = 'low'
     await run('gpt-5.6-sol')
-    await run('gpt-5.3-codex-spark')
+    await run('gpt-6-luna')
     assert.equal(wires[0].text.verbosity, 'high')
     assert.equal(wires[1].text.verbosity, 'low')
-    assert.equal(wires[2].text.verbosity, 'low', 'Spark retains the audited pi-ai wire default when the catalog does not advertise verbosity')
+    assert.equal(wires[2].text.verbosity, 'low', 'a catalog-marked non-verbosity model retains the audited pi-ai wire default')
   } finally {
     globalThis.fetch = previousFetch
   }
@@ -539,9 +550,11 @@ test('context presets preserve catalog defaults and cap every supported model in
 
   if ('gpt-6-astra' in contexts()) assert.equal(contexts()['gpt-6-astra'], 500_000)
   customContextWindow = 64_000
-  assert.equal(contexts()['gpt-5.5'], 128_000)
-  perModel.set('gpt-5.5', 200_000)
-  assert.equal(contexts()['gpt-5.5'], 200_000)
+  // pi-ai 1.4.0 dropped gpt-5.5 from its bundled list; clamp through gpt-6-luna,
+  // which this release ships (272k context window).
+  assert.equal(contexts()['gpt-6-luna'], 128_000)
+  perModel.set('gpt-6-luna', 200_000)
+  assert.equal(contexts()['gpt-6-luna'], 200_000)
 })
 
 test('the Ultrafast tier reaches the wire only for a model the account catalog lists it for', async () => {

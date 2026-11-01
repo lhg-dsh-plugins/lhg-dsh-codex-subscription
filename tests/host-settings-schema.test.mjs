@@ -34,6 +34,12 @@ test('Config uses the settings host schema and later status reads see volatile w
   let notifications = 0
   const fiber = {
     config,
+    // cordis-plugin-loader 1.0.7-alpha.1 commits volatile settings through
+    // `fiber.effectiveConfig` + `fiber.resolveConfig` (previously `fiber.config`
+    // alone); on a real host both read the live fiber (`get effectiveConfig()`,
+    // `resolveConfig(config)`), so the harness mirrors them with the real resolver.
+    effectiveConfig: config,
+    resolveConfig: raw => resolveConfig({ Config: plugin.Config }, raw),
     runtime: { Config: plugin.Config },
     ctx: {
       waterfall: (_fiber, _event, raw) => raw,

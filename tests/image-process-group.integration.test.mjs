@@ -37,10 +37,14 @@ function loadChatAlgorithms() {
     // Virtualised message list (DSH 0.2.1-alpha.3 and later); only used while rendering.
     '@tanstack/react-virtual': {},
   }
-  const exports = descriptor.factory(id => {
+  const requireStub = id => {
     assert.ok(Object.hasOwn(modules, id), `unexpected browser dependency: ${id}`)
     return modules[id]
-  })
+  }
+  // dsh-client-ui-chat 0.2.2-alpha.2 and later resolve static assets through
+  // require.asset while the bundle evaluates (CSS mask URLs); render-only.
+  requireStub.asset = () => 'test-asset-stub'
+  const exports = descriptor.factory(requireStub)
   return exports.__imageGroupTest
 }
 
@@ -111,7 +115,10 @@ function assertIndependentImage(snapshot, grouping, image) {
   assert.equal(toolProcess.turnClosed, true)
   assert.equal(toolProcess.hasInterleavedInput, false)
   assert.equal(toolProcess.hasExternalProcess, true)
-  assert.equal(toolProcess.compactAnswer, true)
+  // dsh-client-ui-chat 0.2.2-alpha.2 removed `compactAnswer` from the process
+  // presentation (replaced by `hasNonReplyProcess`, a different concept), so
+  // there is no compact-answer field left to assert; the unchanged-presentation
+  // guarantee is still enforced by the current-vs-baseline deepEqual below.
 }
 
 test('historical image projection is a root while closed Turn process groups remain tool-only', () => {

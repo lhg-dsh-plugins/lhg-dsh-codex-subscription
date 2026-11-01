@@ -45,7 +45,10 @@ export function originalImageRefsEqual(left, right) {
 
 /** Resolve only an exact original reference copied into a DSH fork prefix. */
 export function inheritedOriginalImageRef(session, assetId) {
+  // dsh-session 0.2.2-alpha.2 no longer writes `header.parentSession` on fork;
+  // a seeded header (`isSeeded: true`) is the fork signal there.
   const parentSession = session?.header?.parentSession
+    ?? (session?.header?.isSeeded === true ? session?.header?.id : undefined)
   const seedLength = session?.inheritedEventCount
   if (typeof parentSession !== 'string' || parentSession.length === 0
     || !Number.isSafeInteger(seedLength) || seedLength < 0
