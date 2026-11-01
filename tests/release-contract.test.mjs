@@ -142,7 +142,7 @@ test('public docs contain only user-facing product and operation information', (
   assert.match(docs, /reset time|重置时间/iu)
   assert.doesNotMatch(docs, /AGENTS\.md/u)
   assert.doesNotMatch(docs, /prompt_cache_key|previous_response_id|backend-api|autoInstallPeers|profiles\/node_modules/iu)
-  assert.doesNotMatch(docs, /github\.com\/WSL043\/(?!(?:dsh-codex-subscription|DSH-Portable)(?:[\/)#]|$))[\w.-]+/iu)
+  assert.doesNotMatch(docs, /github\.com\/WSL043\/(?!(?:dsh-codex-subscription|DSH-Portable)(?:[\/)#\s]|$))[\w.-]+/iu)
   assert.doesNotMatch(docs, /安装提示词|更新提示词|卸载提示词|install prompt|update prompt|uninstall prompt/iu)
   assert.doesNotMatch(docs, /开发与验收|development and verification|pnpm test|pnpm run build|测试覆盖|release-contract|28 项/iu)
   assert.equal(docs.includes(compatibility.latestTested), true)
