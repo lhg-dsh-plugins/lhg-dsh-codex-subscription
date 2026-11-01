@@ -239,7 +239,17 @@ test('subscription fast mode reaches only officially supported Codex model reque
 
   try {
     let speedMode = 'fast'
-    const provider = openaiCodexSubscriptionProvider({ resolveSpeedMode: () => speedMode })
+    // No bundled model lacks fast-mode support in every audited pi-ai release
+    // (0.85.1 through 1.4.0), so the negative case comes from the account catalog
+    // (the production source) marking a model not fast-capable. Like the
+    // production catalog, the stub merges onto the bundled descriptors so the
+    // models stay dispatchable.
+    const bundled = new Map(openaiCodexProvider().getModels().map(model => [model.id, model]))
+    const catalog = {
+      getModels: () => ['gpt-5.6-sol', 'gpt-5.6-luna'].map(id => bundled.get(id)),
+      metadata: id => id === 'gpt-5.6-luna' ? { supportsFast: false } : undefined,
+    }
+    const provider = openaiCodexSubscriptionProvider({ resolveSpeedMode: () => speedMode, catalog })
     const profiles = new Map([['openai-codex', {
       provider: 'openai-codex',
       displayName: 'ChatGPT subscription',
@@ -266,14 +276,12 @@ test('subscription fast mode reaches only officially supported Codex model reque
     }
 
     await run('gpt-5.6-sol')
-    // pi-ai 1.4.0 no longer bundles gpt-5.3-codex-spark; gpt-6-luna ships in this
-    // release and likewise lacks official fast-mode support.
-    await run('gpt-6-luna')
+    await run('gpt-5.6-luna')
     speedMode = 'standard'
     await run('gpt-5.6-sol')
 
     assert.equal(wires[0].service_tier, 'priority')
-    assert.equal('service_tier' in wires[1], false)
+    assert.equal('service_tier' in wires[1], false, 'a catalog-marked non-fast model never opts into priority')
     assert.equal('service_tier' in wires[2], false)
   } finally {
     globalThis.fetch = previousFetch
@@ -301,8 +309,8 @@ test('output detail reaches only verbosity-capable Codex requests', async () => 
     // bundled descriptors so the models stay dispatchable.
     const bundled = new Map(openaiCodexProvider().getModels().map(model => [model.id, model]))
     const catalog = {
-      getModels: () => ['gpt-5.6-sol', 'gpt-6-luna'].map(id => bundled.get(id)),
-      metadata: id => id === 'gpt-6-luna' ? { supportVerbosity: false } : undefined,
+      getModels: () => ['gpt-5.6-sol', 'gpt-5.6-luna'].map(id => bundled.get(id)),
+      metadata: id => id === 'gpt-5.6-luna' ? { supportVerbosity: false } : undefined,
     }
     const provider = openaiCodexSubscriptionProvider({ resolveOutputVerbosity: () => outputVerbosity, catalog })
     const profiles = new Map([['openai-codex', {
@@ -318,7 +326,7 @@ test('output detail reaches only verbosity-capable Codex requests', async () => 
     await run('gpt-5.6-sol')
     outputVerbosity = 'low'
     await run('gpt-5.6-sol')
-    await run('gpt-6-luna')
+    await run('gpt-5.6-luna')
     assert.equal(wires[0].text.verbosity, 'high')
     assert.equal(wires[1].text.verbosity, 'low')
     assert.equal(wires[2].text.verbosity, 'low', 'a catalog-marked non-verbosity model retains the audited pi-ai wire default')
@@ -550,11 +558,11 @@ test('context presets preserve catalog defaults and cap every supported model in
 
   if ('gpt-6-astra' in contexts()) assert.equal(contexts()['gpt-6-astra'], 500_000)
   customContextWindow = 64_000
-  // pi-ai 1.4.0 dropped gpt-5.5 from its bundled list; clamp through gpt-6-luna,
-  // which this release ships (272k context window).
-  assert.equal(contexts()['gpt-6-luna'], 128_000)
-  perModel.set('gpt-6-luna', 200_000)
-  assert.equal(contexts()['gpt-6-luna'], 200_000)
+  // gpt-5.5 left pi-ai's bundled list in 1.4.0; clamp through gpt-6-astra, which
+  // every audited release (0.85.1 through 1.4.0) ships.
+  assert.equal(contexts()['gpt-6-astra'], 128_000)
+  perModel.set('gpt-6-astra', 200_000)
+  assert.equal(contexts()['gpt-6-astra'], 200_000)
 })
 
 test('the Ultrafast tier reaches the wire only for a model the account catalog lists it for', async () => {
